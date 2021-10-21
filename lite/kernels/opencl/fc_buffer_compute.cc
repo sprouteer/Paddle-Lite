@@ -203,6 +203,202 @@ class FcCompute
   cl::Kernel kernel_;
 };
 
+/*************************************int8*********************************/
+class FcComputeInt8
+    : public KernelLite<TARGET(kOpenCL), PRECISION(kInt8), DATALAYOUT(kNCHW)> {
+ public:
+  using param_t = operators::FcParam;
+
+  void PrepareForRun() override {
+    fc_param_ = param_.get_mutable<param_t>();
+    auto w_t = fc_param_->w;
+    auto bias_t = fc_param_->bias;
+
+    if (fc_param_->activation_type == "prelu") {
+      std::string prelu_mode = fc_param_->Prelu_mode;
+      build_options_ += " -DPRELU";
+      if (prelu_mode == "all") {
+        build_options_ += " -DPRELU_ONE";
+      } else {
+        build_options_ += " -DPRELU_MORE";
+      }
+      auto alpha_t = fc_param_->Prelu_alpha;
+      alpha_gpu_t_ = std::unique_ptr<Tensor>(new Tensor);
+      auto alpha_gpu_data =
+          alpha_gpu_t_->mutable_data(TARGET(kOpenCL), alpha_t->memory_size());
+      TargetWrapperCL::MemcpySync(alpha_gpu_data,
+                                  alpha_t->raw_data(),
+                                  alpha_t->memory_size(),
+                                  IoDirection::HtoD);
+    }
+    w_gpu_t_ = std::unique_ptr<Tensor>(new Tensor);
+    auto w_gpu_data =
+        w_gpu_t_->mutable_data(TARGET(kOpenCL), w_t->memory_size());
+    TargetWrapperCL::MemcpySync(
+        w_gpu_data, w_t->raw_data(), w_t->memory_size(), IoDirection::HtoD);
+
+    bias_gpu_t_ = std::unique_ptr<Tensor>(new Tensor);
+    auto b_gpu_data =
+        bias_gpu_t_->mutable_data(TARGET(kOpenCL), bias_t->memory_size());
+    TargetWrapperCL::MemcpySync(b_gpu_data,
+                                bias_t->raw_data(),
+                                bias_t->memory_size(),
+                                IoDirection::HtoD);
+  }
+
+  void ReInitWhenNeeded() override {
+    const auto x_dims = fc_param_->input->dims();
+    if ((!first_epoch_for_reinit_ && x_dims != last_x_dims_) ||
+        first_epoch_for_reinit_) {
+      last_x_dims_ = x_dims;
+      first_epoch_for_reinit_ = false;
+
+      // compute m,n,k
+      const auto w_dims = fc_param_->w->dims();
+      CHECK_GE(x_dims.size(), 2UL);
+      CHECK_GE(w_dims.size(), 2UL);
+      CHECK_EQ(fc_param_->output->dims().size(), 2UL);
+
+      m_ = x_dims.Slice(0, fc_param_->in_num_col_dims).production();
+      k_ = x_dims.Slice(fc_param_->in_num_col_dims, x_dims.size()).production();
+      n_ = w_dims[1];
+      CHECK_EQ(k_, static_cast<int>(w_dims[0]));
+
+#ifdef LITE_WITH_LOG
+      VLOG(4) << "x_dims:" << x_dims[0] << " " << x_dims[1] << " " << x_dims[2]
+              << " " << x_dims[3];
+      VLOG(4) << "w_dims:" << w_dims[0] << " " << w_dims[1] << " " << w_dims[2]
+              << " " << w_dims[3];
+      VLOG(4) << "m_: " << m_ << " n_: " << n_ << " k_: " << k_;
+#endif
+
+      // choose kernel
+      if (m_ == 1) {  // gemv
+        kernel_func_name_ = "fc_gemv_quantized_1x4";
+        std::cout << "~~~~~~~~~~~fc_gemv_quantized_1x4" << std::endl;
+      } else {  // gemm
+        kernel_func_name_ = "fc_gemm_4x4";
+      }
+#ifdef LITE_WITH_LOG
+      VLOG(1) << "kernel_func_name_:" << kernel_func_name_;
+#endif
+
+      if (fc_param_->activation_type == "relu") {
+        build_options_ += "-DRELU";
+      }
+
+      auto& context = ctx_->As<OpenCLContext>();
+      context.cl_context()->AddKernel(kernel_func_name_,
+                                      "buffer/fc_kernel.cl",
+                                      build_options_,
+                                      time_stamp_);
+      STL::stringstream kernel_key;
+      kernel_key << kernel_func_name_ << build_options_ << time_stamp_;
+      kernel_ = context.cl_context()->GetKernel(kernel_key.str());
+
+      // compute global work size
+      GetGlobalWorkSize();
+    }
+  }
+
+  void GetGlobalWorkSize() {
+    if (kernel_func_name_ == "fc_gemv_1x4" ||
+        kernel_func_name_ == "fc_gemv_quantized_1x4") {  // gemv
+      global_work_size_ = cl::NDRange{static_cast<size_t>((n_ + 3) / 4)};
+    } else {  // gemm
+      global_work_size_ = cl::NDRange{static_cast<size_t>((m_ + 3) / 4),
+                                      static_cast<size_t>((n_ + 3) / 4)};
+    }
+  }
+
+  void Run() override {
+    auto* x_buf = fc_param_->input->data<int8_t, cl::Buffer>();
+    auto* w_buf = w_gpu_t_->data<int8_t, cl::Buffer>();
+    auto* bias_buf = bias_gpu_t_->data<int8_t, cl::Buffer>();
+    const cl::Buffer* alpha_buf = nullptr;
+    if (fc_param_->activation_type == "prelu") {
+      alpha_buf = alpha_gpu_t_->data<int8_t, cl::Buffer>();
+    }
+    auto* out_buf =
+        fc_param_->output->mutable_data<float, cl::Buffer>(TARGET(kOpenCL));
+
+    auto kernel = kernel_;
+    cl_int status;
+    status = kernel.setArg(0, *x_buf);
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(1, *w_buf);
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(2, *bias_buf);
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(3, *out_buf);
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(4, static_cast<const int>(m_));
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(5, static_cast<const int>(n_));
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(6, static_cast<const int>(k_));
+    CL_CHECK_FATAL(status);
+    status = kernel.setArg(7, *alpha_buf);
+    CL_CHECK_FATAL(status);
+
+    auto& context = ctx_->As<OpenCLContext>();
+    CHECK(context.cl_context() != nullptr);
+
+    status = EnqueueNDRangeKernel(context,
+                                  kernel,
+                                  cl::NullRange,
+                                  global_work_size_,
+                                  cl::NullRange,
+                                  nullptr,
+                                  event_);
+    CL_CHECK_FATAL(status);
+
+    // #ifdef LITE_WITH_PROFILE
+    event_.wait();
+    auto queue_start_nanos =
+        event_.getProfilingInfo<CL_PROFILING_COMMAND_QUEUED>();
+    auto submit_start_nanos =
+        event_.getProfilingInfo<CL_PROFILING_COMMAND_SUBMIT>();
+    auto run_start_nanos =
+        event_.getProfilingInfo<CL_PROFILING_COMMAND_START>();
+    auto run_stop_nanos = event_.getProfilingInfo<CL_PROFILING_COMMAND_END>();
+
+    double time_ms = (submit_start_nanos - queue_start_nanos) / 1000000.0;
+    VLOG(4) << "GetQueuedToSubmitTime: " << time_ms << std::endl;
+
+    time_ms = (run_start_nanos - submit_start_nanos) / 1000000.0;
+    VLOG(4) << "GetSubmitToStartTime: " << time_ms << std::endl;
+
+    time_ms = (run_stop_nanos - run_start_nanos) / 1000000.0;
+    VLOG(4) << "GetStartToEndTime: " << time_ms << std::endl;
+    // #endif
+  }
+
+#ifdef LITE_WITH_PROFILE
+  void SetProfileRuntimeKernelInfo(paddle::lite::profile::OpCharacter* ch) {
+    ch->kernel_func_name = kernel_func_name_;
+    ch->cl_event =
+        event_;  // `event_` defined in `kernel.h`, valid after kernel::Run
+  }
+#endif
+
+ private:
+  int m_, n_, k_;
+  param_t* fc_param_{nullptr};
+  std::string kernel_func_name_{};
+  std::string build_options_{"-DCL_DTYPE_half "};
+  std::string time_stamp_{GetTimeStamp()};
+  bool first_epoch_for_reinit_{true};
+  DDim last_x_dims_;
+
+  std::unique_ptr<Tensor> w_gpu_t_{nullptr};
+  std::unique_ptr<Tensor> bias_gpu_t_{nullptr};
+  std::unique_ptr<Tensor> alpha_gpu_t_{nullptr};
+
+  cl::NDRange global_work_size_;
+  cl::Kernel kernel_;
+};
+
 }  // namespace opencl
 }  // namespace kernels
 }  // namespace lite
@@ -219,6 +415,28 @@ REGISTER_LITE_KERNEL(
 
 REGISTER_LITE_KERNEL(
     fc, kOpenCL, kFloat, kNCHW, paddle::lite::kernels::opencl::FcCompute, pc)
+    .BindInput("Input", {LiteType::GetTensorTy(TARGET(kOpenCL))})
+    .BindInput("Bias", {LiteType::GetTensorTy(TARGET(kHost))})
+    .BindInput("W", {LiteType::GetTensorTy(TARGET(kHost))})
+    .BindInput("Alpha", {LiteType::GetTensorTy(TARGET(kARM))})
+    .BindOutput("Out", {LiteType::GetTensorTy(TARGET(kOpenCL))})
+    .Finalize();
+
+REGISTER_LITE_KERNEL(fc,
+                     kOpenCL,
+                     kInt8,
+                     kNCHW,
+                     paddle::lite::kernels::opencl::FcComputeInt8,
+                     def)
+    .BindInput("Input", {LiteType::GetTensorTy(TARGET(kOpenCL))})
+    .BindInput("Bias", {LiteType::GetTensorTy(TARGET(kARM))})
+    .BindInput("W", {LiteType::GetTensorTy(TARGET(kARM))})
+    .BindInput("Alpha", {LiteType::GetTensorTy(TARGET(kARM))})
+    .BindOutput("Out", {LiteType::GetTensorTy(TARGET(kOpenCL))})
+    .Finalize();
+
+REGISTER_LITE_KERNEL(
+    fc, kOpenCL, kInt8, kNCHW, paddle::lite::kernels::opencl::FcComputeInt8, pc)
     .BindInput("Input", {LiteType::GetTensorTy(TARGET(kOpenCL))})
     .BindInput("Bias", {LiteType::GetTensorTy(TARGET(kHost))})
     .BindInput("W", {LiteType::GetTensorTy(TARGET(kHost))})

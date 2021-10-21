@@ -348,6 +348,187 @@ __kernel void fc_gemv_1x4(__global const float* a,
   }
 }
 
+inline int4 activation_quantized_type4(int4 in, int4 prelu_alpha) {
+  int4 output = in;
+// #ifdef PRELU
+//   output =
+//       select(prelu_alpha * in, in, isgreaterequal(in, (int4)0));
+// #endif
+
+#ifdef RELU
+  output = max(in, (int4)0);
+#endif
+
+  // #ifdef RELU6
+  //   in = max((int4)(0, 0, 0, 0), in);
+  //   output = min((int4)(6, 6, 6, 6), in);
+  // #endif
+
+  // #ifdef LEAKY_RELU
+  //   output = select((int4)(LEAKY_RELU_ALPHA)*in,
+  //                   in,
+  //                   isgreaterequal(in, (int4)0));
+  // #endif
+
+  // #ifdef HARD_SWISH
+  //   output = min(max(in + (int4)ACT_OFFSET, (int4)0),
+  //                 (int4)ACT_THRESHOLD) *
+  //            in / (int4)ACT_SCALE;
+  // #endif
+
+  // #ifdef HARD_SIGMOID
+  //   output = clamp(in * (CL_COMPUTE_DTYPE4)HARD_SIGMOID_SLOPE +
+  //                      (CL_COMPUTE_DTYPE4)HARD_SIGMOID_OFFSET,
+  //                  (CL_COMPUTE_DTYPE4)0.0,
+  //                  (CL_COMPUTE_DTYPE4)1.0);
+  // #endif
+
+  return output;
+}
+
+inline int activation_quantized(int in, int prelu_alpha) {
+  int output = in;
+// #ifdef PRELU
+//   output = select(prelu_alpha * in, in, (uint)(isgreaterequal(in, 0)));
+// #endif
+
+#ifdef RELU
+  output = max(in, (int)0);
+#endif
+
+  // #ifdef RELU6
+  //   output = clamp(in, (CL_DTYPE)0, (CL_DTYPE)6);
+  // #endif
+
+  // #ifdef LEAKY_RELU
+  // #ifdef CL_DTYPE_half
+  //   output = select(
+  //       (CL_DTYPE)(LEAKY_RELU_ALPHA)*in, in, (ushort)(isgreaterequal(in,
+  //       0)));
+  // #else
+  //   output = select(
+  //       (CL_DTYPE)(LEAKY_RELU_ALPHA)*in, in, (uint)(isgreaterequal(in, 0)));
+  // #endif
+  // #endif
+
+  // #ifdef HARD_SWISH
+  //   output = fmin(fmax(in + (CL_DTYPE)ACT_OFFSET, (CL_DTYPE)0),
+  //                 (CL_DTYPE)ACT_THRESHOLD) *
+  //            in / (CL_DTYPE)ACT_SCALE;
+  // #endif
+
+  // #ifdef HARD_SIGMOID
+  //   output =
+  //       clamp(in * (CL_DTYPE)HARD_SIGMOID_SLOPE +
+  //       (CL_DTYPE)HARD_SIGMOID_OFFSET,
+  //             (CL_DTYPE)0.0,
+  //             (CL_DTYPE)1.0);
+  // #endif
+
+  return output;
+}
+
+__kernel void fc_gemv_quantized_1x4(__global const char* a,
+                                    __global const char* b,
+                                    __global const char* bias,
+                                    __global float* c,
+                                    const int M,
+                                    const int N,
+                                    const int K,
+                                    __global const int* alpha) {
+  const int col = get_global_id(0)
+                  << 2;  // gws[0]: [0, N >> 2) height of B == N
+
+  if (col + 3 < N) {
+    int4 c0 = 0;
+    if (bias) {
+      c0.x = convert_int(bias[col]);
+      c0.y = convert_int(bias[col + 1]);
+      c0.z = convert_int(bias[col + 2]);
+      c0.w = convert_int(bias[col + 3]);
+    }
+
+    //     // main loop of K
+    int p = 0;
+    for (; p < K - 3; p += 4) {
+      int4 a0 = convert_int4(vload4(0, a + p));
+
+      int4 b0 = convert_int4(vload4(0, b + p * N + col));
+      int4 b1 = convert_int4(vload4(0, b + (p + 1) * N + col));
+      int4 b2 = convert_int4(vload4(0, b + (p + 2) * N + col));
+      int4 b3 = convert_int4(vload4(0, b + (p + 3) * N + col));
+
+      c0 += a0.x * b0;
+      c0 += a0.y * b1;
+      c0 += a0.z * b2;
+      c0 += a0.w * b3;
+    }
+
+    // compute left K
+    int4 b2 = 0, b1 = 0, b0 = 0, a0 = 0;
+    switch (K - p) {
+      case 3: {
+        b2 = convert_int4(vload4(0, b + (p + 2) * N + col));
+        a0.z = a[p + 2];
+      }
+      case 2: {
+        b1 = convert_int4(vload4(0, b + (p + 1) * N + col));
+        a0.y = a[p + 1];
+      }
+      case 1: {
+        b0 = convert_int4(vload4(0, b + (p)*N + col));
+        a0.x = a[p];
+      }
+    }
+    c0 += a0.x * b0;
+    c0 += a0.y * b1;
+    c0 += a0.z * b2;
+
+    int4 alpha0 = 0;
+#ifdef PRELU_MORE
+    alpha0.x = alpha[col];
+    alpha0.y = alpha[col + 1];
+    alpha0.z = alpha[col + 2];
+    alpha0.w = alpha[col + 3];
+#else
+    alpha0.x = alpha[0];
+    alpha0.y = alpha[0];
+    alpha0.z = alpha[0];
+    alpha0.w = alpha[0];
+#endif
+    if (col % 4 == 0) {
+      int4 act_res = convert_int4(activation_quantized_type4(c0, alpha0));
+      vstore4(convert_float4(act_res), 0, c + col);
+    } else {
+      switch (col % 4) {
+        case 3:
+          c[col + 2] = convert_float(activation_quantized(c0.z, alpha0.z));
+        case 2:
+          c[col + 1] = convert_float(activation_quantized(c0.y, alpha0.y));
+        case 1:
+          c[col] = convert_float(activation_quantized(c0.x, alpha0.x));
+      }
+    }
+  } else {
+    const int left_col = N - col;
+    for (int col_offset = 0; col_offset < left_col; ++col_offset) {
+      int c0 = bias ? bias[col] : 0;
+      for (int p = 0; p < K; ++p) {
+        int b0 = *(b + p * N + col + col_offset);
+        int a0 = *(a + p);
+        c0 += a0 * b0;
+      }
+      int alpha0 = 0;
+#ifdef PRELU_MORE
+      alpha0 = alpha[col];
+#else
+      alpha0 = alpha[0];
+#endif
+      c[col + col_offset] = convert_float(activation_quantized(c0, alpha0));
+    }
+  }
+}
+
 // fc_gemm_4x4: for fc with M = 1
 // a: param.input  {M, K}
 // b: param.w      {K, N}
