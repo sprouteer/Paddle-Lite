@@ -48,6 +48,14 @@ const int NBLOCK_INT8_OTH = 16;
 const int MBLOCK_INT8_DOT = 8;
 const int NBLOCK_INT8_DOT = 12;
 
+void packb_sdot_int8_n12_n8_n4(int8_t* out,
+                               const int8_t* in,
+                               const int ldin,
+                               const int k0,
+                               const int kmax,
+                               const int n0,
+                               const int nmax);
+
 inline int get_hblock_int8(ARMContext* ctx) {
 #ifdef WITH_ARM_DOTPROD
   if (ctx->has_dot()) {
@@ -110,6 +118,7 @@ void gemm_prepack_int8(const int8_t* A_packed,
                        bool is_bias,
                        GemmBiasDirection bias_direction,
                        bool is_transB,
+                       bool packed_b,
                        const float* scale,
                        const operators::ActivationParam act_param,
                        ARMContext* ctx);

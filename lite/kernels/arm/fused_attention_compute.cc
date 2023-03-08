@@ -66,12 +66,61 @@ void TransposeCompute_1to3(int8_t* input,
 template <>
 void FusedAttentionCompute<PRECISION(kInt8)>::PrepareForRun() {
   ReInitWhenNeeded();
+  auto& param = this->template Param<param_t>();
+  // prepack weight
+  auto& ctx = this->ctx_->template As<ARMContext>();
+#ifdef __aarch64__
+  if (ctx.has_dot()) {
+#ifdef WITH_ARM_DOTPROD
+    size_t llc_size = ctx.llc_size() / 4;
+    int x_block = (llc_size - (lite::arm::math::MBLOCK_INT8_DOT * fc_k_)) /
+                  (sizeof(int8_t) * (fc_k_ + lite::arm::math::MBLOCK_INT8_DOT));
+    x_block /= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+
+    int x_num = (fc_n_ + (x_block - 1)) / x_block;
+    x_block = (fc_n_ + x_num - 1) / x_num;
+    x_block = (x_block + lite::arm::math::NBLOCK_INT8_DOT - 1) /
+              lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block = x_block < lite::arm::math::NBLOCK_INT8_DOT
+                  ? lite::arm::math::NBLOCK_INT8_DOT
+                  : x_block;
+
+    DDim prepack_w_dim_ =
+        DDim(std::vector<int64_t>{fc_k_, ROUNDUP(fc_n_, x_block)});
+    Tensor prepack_w;
+    prepack_w.Resize(prepack_w_dim_);
+    int8_t* prepack_w_data_ = prepack_w.mutable_data<int8_t>();
+    auto* w_data = param.fc_w->template data<int8_t>();
+
+    for (unsigned int x0 = 0; x0 < fc_n_; x0 += x_block) {
+      unsigned int xmax = x0 + x_block;
+      xmax = (xmax > fc_n_) ? fc_n_ : xmax;
+      lite::arm::math::packb_sdot_int8_n12_n8_n4(
+          prepack_w_data_ + x0 * fc_k_, w_data, fc_n_, 0, fc_k_, x0, xmax);
+    }
+    param.fc_w->Resize(prepack_w_dim_);
+    param.fc_w->CopyDataFrom(prepack_w);
+#endif
+  } else {
+    // TODO(sprouteer):
+    LOG(ERROR) << "oth need add support";
+  }
+#else
+  // TODO(sprouteer):
+  LOG(ERROR) << "v7 need add support";
+#endif
 }
+
 template <PrecisionType PType>
 void FusedAttentionCompute<PType>::ReInitWhenNeeded() {
   auto& param = this->template Param<param_t>();
   auto input_dims = param.input->dims();
-
+  if (last_shape_ == input_dims) {
+    return;
+  }
+  last_shape_ = input_dims;
   // fc
   act_param_.has_active = false;
   if (param.activation_type == "relu") {
@@ -150,6 +199,7 @@ void FusedAttentionCompute<PRECISION(kInt8)>::Run() {
   auto* b_data = param.fc_bias ? param.fc_bias->data<float>() : nullptr;
   lite::arm::math::gemm_s8<int8_t>(false,
                                    false,
+                                   true,
                                    fc_m_,
                                    fc_n_,
                                    fc_k_,
@@ -187,6 +237,7 @@ void FusedAttentionCompute<PRECISION(kInt8)>::Run() {
   for (size_t i = 0; i < transpose_out_dim_[1]; ++i) {
     lite::arm::math::gemm_s8(false,
                              true,
+                             false,
                              fc1_m_,
                              fc1_n_,
                              fc1_k_,
@@ -239,6 +290,7 @@ void FusedAttentionCompute<PRECISION(kInt8)>::Run() {
   int fc2_out_inner = fc2_m_ * fc2_n_;
   for (size_t i = 0; i < out_dims[1]; ++i) {
     lite::arm::math::gemm_s8<float>(false,
+                                    false,
                                     false,
                                     fc2_m_,
                                     fc2_n_,

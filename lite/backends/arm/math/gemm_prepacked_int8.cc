@@ -5840,6 +5840,7 @@ void gemm_prepack_sdot_int8(const int8_t* A_packed,
                             GemmBiasDirection bias_direction,
                             int is_relu,
                             bool is_transB,
+                            bool packed_b,
                             const float* scale,
                             const float* alpha,
                             ARMContext* ctx) {
@@ -5877,14 +5878,20 @@ void gemm_prepack_sdot_int8(const int8_t* A_packed,
     if (remain > 0) {
       flag_p_remain = true;
     }
-    //! load bpanel
-    auto b_pannel = static_cast<int8_t*>(workspace);
-    if (!is_transB) {
-      // K * N
-      packb_sdot_int8_n12_n8_n4(b_pannel, B, N, 0, K, x0, xmax);
+
+    int8_t* b_pannel = nullptr;
+    if (packed_b) {
+      b_pannel = const_cast<int8_t*>(B) + x0 * K;
     } else {
-      // N X K
-      packb_sdot_int8_n12_n8_n4_trans(b_pannel, B, K, 0, K, x0, xmax);
+      //! load bpanel
+      b_pannel = static_cast<int8_t*>(workspace);
+      if (!is_transB) {
+        // K * N
+        packb_sdot_int8_n12_n8_n4(b_pannel, B, N, 0, K, x0, xmax);
+      } else {
+        // N X K
+        packb_sdot_int8_n12_n8_n4_trans(b_pannel, B, K, 0, K, x0, xmax);
+      }
     }
 
     LITE_PARALLEL_COMMON_BEGIN(y, tid, M, 0, MBLOCK_INT8_DOT) {
@@ -8087,6 +8094,7 @@ void gemm_prepack_int8(const int8_t* A_packed,
                        bool is_bias,
                        GemmBiasDirection bias_direction,
                        bool is_transB,
+                       bool packed_b,
                        const float* scale,
                        const operators::ActivationParam act_param,
                        ARMContext* ctx) {
@@ -8124,10 +8132,15 @@ void gemm_prepack_int8(const int8_t* A_packed,
 #define IN_PARAMS                                                              \
   A_packed, B, bias, C, M, N, K, is_bias, bias_direction, flag_act, is_transB, \
       scale, alpha, ctx
+
+#define IN_PARAMS_PACKED_B                                                     \
+  A_packed, B, bias, C, M, N, K, is_bias, bias_direction, flag_act, is_transB, \
+      packed_b, scale, alpha, ctx
+
 #ifdef __aarch64__
   if (ctx->has_dot()) {
 #ifdef WITH_ARM_DOTPROD
-    gemm_prepack_sdot_int8<dtype>(IN_PARAMS);
+    gemm_prepack_sdot_int8<dtype>(IN_PARAMS_PACKED_B);
 #endif
   } else {
     gemm_prepack_oth_int8<dtype>(IN_PARAMS);
@@ -8155,6 +8168,7 @@ void gemm_prepack_int8(const int8_t* A_packed,
       bool is_bias,                               \
       GemmBiasDirection bias_direction,           \
       bool is_transB,                             \
+      bool packed_b,                              \
       const float* scale,                         \
       const operators::ActivationParam act_param, \
       ARMContext* ctx);

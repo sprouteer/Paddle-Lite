@@ -139,6 +139,47 @@ void FcCompute<PRECISION(kInt8), PRECISION(kFloat)>::PrepareForRun() {
       scale_[i] = param.weight_scale[i] * input_scale;
     }
   }
+  auto& ctx = this->ctx_->template As<ARMContext>();
+#ifdef __aarch64__
+  if (ctx.has_dot()) {
+#ifdef WITH_ARM_DOTPROD
+    // prepack weight
+    size_t llc_size = ctx.llc_size() / 4;
+    int x_block = (llc_size - (lite::arm::math::MBLOCK_INT8_DOT * k_)) /
+                  (sizeof(int8_t) * (k_ + lite::arm::math::MBLOCK_INT8_DOT));
+    x_block /= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+
+    int x_num = (n_ + (x_block - 1)) / x_block;
+    x_block = (n_ + x_num - 1) / x_num;
+    x_block = (x_block + lite::arm::math::NBLOCK_INT8_DOT - 1) /
+              lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block = x_block < lite::arm::math::NBLOCK_INT8_DOT
+                  ? lite::arm::math::NBLOCK_INT8_DOT
+                  : x_block;
+
+    DDim prepack_w_dim_ = DDim(std::vector<int64_t>{k_, ROUNDUP(n_, x_block)});
+    Tensor prepack_w;
+    prepack_w.Resize(prepack_w_dim_);
+    auto* prepack_w_data = prepack_w.mutable_data<int8_t>();
+    auto* w_data = param.w->template data<int8_t>();
+
+    for (unsigned int x0 = 0; x0 < n_; x0 += x_block) {
+      unsigned int xmax = x0 + x_block;
+      xmax = (xmax > n_) ? n_ : xmax;
+      lite::arm::math::packb_sdot_int8_n12_n8_n4(
+          prepack_w_data + x0 * k_, w_data, n_, 0, k_, x0, xmax);
+    }
+    param.w->Resize(prepack_w_dim_);
+    param.w->CopyDataFrom(prepack_w);
+#endif
+  } else {
+    LOG(ERROR) << "oth need add support";
+  }
+#else
+  LOG(ERROR) << "v7 need add support";
+#endif
 }
 
 /// for int8 kernel with int8 output
@@ -170,6 +211,49 @@ void FcCompute<PRECISION(kInt8), PRECISION(kInt8)>::PrepareForRun() {
     }
     flag_trans_bias_ = true;
   }
+  auto& ctx = this->ctx_->template As<ARMContext>();
+#ifdef __aarch64__
+  if (ctx.has_dot()) {
+#ifdef WITH_ARM_DOTPROD
+    // prepack weight
+    size_t llc_size = ctx.llc_size() / 4;
+    int x_block = (llc_size - (lite::arm::math::MBLOCK_INT8_DOT * k_)) /
+                  (sizeof(int8_t) * (k_ + lite::arm::math::MBLOCK_INT8_DOT));
+    x_block /= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+
+    int x_num = (n_ + (x_block - 1)) / x_block;
+    x_block = (n_ + x_num - 1) / x_num;
+    x_block = (x_block + lite::arm::math::NBLOCK_INT8_DOT - 1) /
+              lite::arm::math::NBLOCK_INT8_DOT;
+    x_block *= lite::arm::math::NBLOCK_INT8_DOT;
+    x_block = x_block < lite::arm::math::NBLOCK_INT8_DOT
+                  ? lite::arm::math::NBLOCK_INT8_DOT
+                  : x_block;
+
+    DDim prepack_w_dim_ = DDim(std::vector<int64_t>{k_, ROUNDUP(n_, x_block)});
+    Tensor prepack_w;
+    prepack_w.Resize(prepack_w_dim_);
+    auto* prepack_w_data = prepack_w.mutable_data<int8_t>();
+    auto* w_data = param.w->template data<int8_t>();
+
+    for (unsigned int x0 = 0; x0 < n_; x0 += x_block) {
+      unsigned int xmax = x0 + x_block;
+      xmax = (xmax > n_) ? n_ : xmax;
+      lite::arm::math::packb_sdot_int8_n12_n8_n4(
+          prepack_w_data + x0 * k_, w_data, n_, 0, k_, x0, xmax);
+    }
+    param.w->Resize(prepack_w_dim_);
+    param.w->CopyDataFrom(prepack_w);
+#endif
+  } else {
+    // TODO(sprouteer):
+    LOG(ERROR) << "oth need add support";
+  }
+#else
+  // TODO(sprouteer):
+  LOG(ERROR) << "v7 need add support";
+#endif
 }
 
 template <>
@@ -270,6 +354,7 @@ void FcCompute<PRECISION(kInt8), PRECISION(kFloat)>::Run() {
   if (flag_gemm_) {
     lite::arm::math::gemm_s8(false,
                              false,
+                             true,
                              m_,
                              n_,
                              k_,
@@ -327,6 +412,7 @@ void FcCompute<PRECISION(kInt8), PRECISION(kInt8)>::Run() {
   if (flag_gemm_) {
     lite::arm::math::gemm_s8(false,
                              false,
+                             true,
                              m_,
                              n_,
                              k_,
