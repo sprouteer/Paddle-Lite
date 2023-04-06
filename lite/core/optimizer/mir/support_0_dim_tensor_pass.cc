@@ -21,6 +21,11 @@ namespace paddle {
 namespace lite {
 namespace mir {
 
+// In order to temporarily support 0-dimensional Tensor
+// 1. Modify Attr(shape) from [] to [1], include OPs(fill_constant,
+// uniform_random, expand_v2, assign_value, gaussian_random, set_value)
+// 2. Modify the shape of variables from [] to [1]
+
 void Support0DimTensor::Apply(const std::unique_ptr<SSAGraph>& graph) {
   // fix attr
   const std::vector<std::string> op_cases_fix_attr{"fill_constant",
